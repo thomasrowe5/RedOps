@@ -113,8 +113,22 @@ def parse_timestamp(value: JsonValue) -> Optional[datetime]:
     if value is None:
         return None
 
-    if isinstance(value, (int, float)) and not math.isnan(float(value)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if math.isnan(number):
+            return None
+
+        # Many telemetry sources emit epoch timestamps in milliseconds.  These
+        # values exceed the range expected by ``datetime.fromtimestamp`` and will
+        # raise ``ValueError`` unless scaled.  Heuristically detect values with
+        # 13+ digits and convert them to seconds before parsing.
+        if abs(number) >= 1e11:
+            number /= 1000.0
+
+        try:
+            return datetime.fromtimestamp(number, tz=timezone.utc)
+        except (OverflowError, ValueError):
+            return None
 
     if isinstance(value, str):
         text = value.strip()
