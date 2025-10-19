@@ -1,0 +1,5 @@
+credential-access: T1555
+lateral-movement: T1021
+persistence: T1053
+initial-access: T1190
+command-and-control: T1105
