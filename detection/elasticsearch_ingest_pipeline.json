@@ -1,0 +1,80 @@
+{
+  "description": "Ingest pipeline for RedOps agent telemetry mapping to ECS fields.",
+  "processors": [
+    {
+      "json": {
+        "field": "message",
+        "add_to_root": true,
+        "ignore_failure": true
+      }
+    },
+    {
+      "date": {
+        "field": "timestamp",
+        "target_field": "@timestamp",
+        "formats": ["ISO8601"],
+        "ignore_failure": true
+      }
+    },
+    {
+      "rename": {
+        "field": "agent_id",
+        "target_field": "agent.id",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "note",
+        "target_field": "message",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "tactic",
+        "target_field": "threat.tactic.name",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "technique",
+        "target_field": "threat.technique.name",
+        "ignore_missing": true
+      }
+    },
+    {
+      "set": {
+        "field": "event.kind",
+        "value": "alert"
+      }
+    },
+    {
+      "set": {
+        "field": "event.category",
+        "value": "intrusion_detection"
+      }
+    },
+    {
+      "set": {
+        "field": "event.type",
+        "value": ["indicator"]
+      }
+    },
+    {
+      "set": {
+        "field": "observer.type",
+        "value": "redops-agent"
+      }
+    }
+  ],
+  "on_failure": [
+    {
+      "set": {
+        "field": "error.message",
+        "value": "Failed to process RedOps agent event"
+      }
+    }
+  ]
+}

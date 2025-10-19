@@ -1,0 +1,34 @@
+title: Multiple Suspicious Upload Attempts from Rare User Agent
+id: 4d5eb75a-2c97-46a7-8a66-73a05289755c
+status: experimental
+description: Detects repeated POST requests to the vulnerable upload endpoint coming from user agents that are not in the expected baseline list.
+author: ChatGPT (gpt-5-codex)
+date: 2024/07/05
+references: []
+tags:
+  - attack.initial_access
+  - attack.t1566
+logsource:
+  category: webserver
+  product: generic
+  service: http
+detection:
+  selection_upload:
+    http.request.method: POST
+    url.path|contains: "/upload"
+  filter_known_agents:
+    user_agent.original|startswith:
+      - "Mozilla/5.0"
+      - "curl/"
+      - "Wget/"
+  condition: selection_upload and not filter_known_agents | count() by user_agent.original > 3
+fields:
+  - @timestamp
+  - http.request.method
+  - url.full
+  - user_agent.original
+  - source.ip
+level: high
+falsepositives:
+  - Automated scanners using custom agents for testing
+  - Newly introduced monitoring tools not yet baselined
