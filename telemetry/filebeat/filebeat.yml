@@ -1,0 +1,51 @@
+# Filebeat configuration for RedOps telemetry collection.
+#
+# By default logs are shipped to Logstash running on localhost:5044.
+# To send logs directly to Elasticsearch ingest, comment out the Logstash
+# output and uncomment the Elasticsearch block below.
+
+filebeat.inputs:
+  - type: filestream
+    id: redops-application-logs
+    enabled: true
+    paths:
+      - ${REDOPS_LOG_PATHS:/var/log/redops/*.log}
+    parsers:
+      - multiline:
+          pattern: '^\['
+          negate: true
+          match: after
+    fields:
+      dataset: redops.application
+    fields_under_root: true
+
+processors:
+  - add_host_metadata: ~
+  - add_cloud_metadata: ~
+  - add_fields:
+      target: event
+      fields:
+        module: redops
+  - timestamp:
+      field: event.created
+      layouts:
+        - ISO8601
+      timezone: UTC
+      ignore_missing: true
+
+setup.ilm.enabled: false
+setup.template.enabled: true
+setup.template.name: "redops-telemetry"
+setup.template.pattern: "redops-telemetry-*"
+
+output.logstash:
+  hosts: ["${LOGSTASH_HOSTS:localhost:5044}"]
+  ssl.enabled: ${LOGSTASH_SSL:false}
+
+# Uncomment to ship directly to Elasticsearch ingest instead of Logstash.
+# output.elasticsearch:
+#   hosts: ["${ELASTICSEARCH_HOSTS:http://localhost:9200}"]
+#   pipeline: "${ELASTICSEARCH_INGEST_PIPELINE:redops-telemetry}"
+#   index: "redops-telemetry-%{+yyyy.MM.dd}"
+#   username: "${ELASTICSEARCH_USERNAME:}"
+#   password: "${ELASTICSEARCH_PASSWORD:}"
