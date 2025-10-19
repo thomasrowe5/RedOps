@@ -1,31 +1,71 @@
 version: "3.9"
 
+networks:
+  redops_net:
+    driver: bridge
+
 services:
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
     environment:
       - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - xpack.security.enabled=false
     ports:
       - "9200:9200"
-    # Placeholder configuration for lab use only.
+    volumes:
+      - elastic-data:/usr/share/elasticsearch/data
+    networks:
+      - redops_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    # Elasticsearch configured for single-node development use in the lab.
 
   kibana:
     image: docker.elastic.co/kibana/kibana:8.13.0
     ports:
       - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
     depends_on:
-      - elasticsearch
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - redops_net
 
   neo4j:
     image: neo4j:5.19
+    environment:
+      - NEO4J_AUTH=none
     ports:
       - "7474:7474"
       - "7687:7687"
-    environment:
-      - NEO4J_AUTH=none
+    volumes:
+      - neo4j-data:/data
+    networks:
+      - redops_net
 
   juice-shop:
     image: bkimminich/juice-shop
     ports:
       - "3000:3000"
-    # Intended for controlled vulnerability simulations only.
+    networks:
+      - redops_net
+    # Official OWASP Juice Shop image for controlled vulnerability simulations.
+
+  vuln-service:
+    build:
+      context: ./vuln-service
+    ports:
+      - "5000:5000"
+    networks:
+      - redops_net
+    # Intentionally vulnerable file upload service for lab testing only.
+
+volumes:
+  elastic-data:
+  neo4j-data:
