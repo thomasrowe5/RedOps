@@ -1,0 +1,9 @@
+# Placeholder Filebeat configuration for lab telemetry collection.
+filebeat.inputs:
+  - type: logfile
+    enabled: false
+    paths:
+      - /var/log/redops/*.log
+
+output.console:
+  enabled: true
