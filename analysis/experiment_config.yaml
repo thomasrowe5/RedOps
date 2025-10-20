@@ -1,0 +1,45 @@
+# Default environment parameters for orchestrating RL experiments.
+env:
+  # Base URL for the environment orchestrator service that coordinates runs.
+  orchestrator: "http://localhost:8000"
+  # Maximum number of environment steps to execute per episode.
+  max_steps: 100
+  # Prefix used to label experiment run identifiers for easier tracking.
+  run_prefix: "rl-exp"
+
+# Reinforcement learning hyperparameters for the PPO algorithm.
+rl:
+  # Algorithm name to ensure downstream scripts load the proper trainer.
+  algorithm: "PPO"
+  # Total number of timesteps to collect across training.
+  total_timesteps: 200_000
+  # Random seed to make runs reproducible.
+  seed: 42
+  # Optimizer learning rate controlling parameter updates.
+  learning_rate: 0.0003
+  # Number of steps to run in each rollout before performing an update.
+  n_steps: 2048
+  # Batch size used during optimization of the policy network.
+  batch_size: 64
+  # Number of epochs to iterate over each batch of collected data.
+  n_epochs: 10
+  # Discount factor for future rewards.
+  gamma: 0.99
+  # Lambda for Generalized Advantage Estimation smoothing.
+  gae_lambda: 0.95
+  # Clipping parameter for PPO objective to stabilize updates.
+  clip_range: 0.2
+
+# Logging and checkpointing configuration.
+logging:
+  # Interval (in timesteps) at which to persist training artifacts.
+  save_interval: 5000
+  # Directory to store trained policy checkpoints and metadata.
+  checkpoint_dir: "models/rl/"
+
+# High-level experiment orchestration settings.
+experiment:
+  # Number of distinct seeds to evaluate for statistical significance.
+  num_seeds: 5
+  # List of policy baselines to benchmark against the RL agent.
+  policies: ["random", "rule", "rl"]
