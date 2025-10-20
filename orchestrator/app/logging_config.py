@@ -6,18 +6,29 @@ import logging
 import sys
 from typing import Any, Dict
 
-import structlog
-from structlog.contextvars import get_contextvars, merge_contextvars
-from structlog.stdlib import BoundLogger, LoggerFactory, ProcessorFormatter
+try:
+    import structlog
+    from structlog.contextvars import get_contextvars, merge_contextvars
+    from structlog.stdlib import BoundLogger, LoggerFactory, ProcessorFormatter
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    structlog = None  # type: ignore[assignment]
+    get_contextvars = merge_contextvars = None  # type: ignore[assignment]
+    BoundLogger = LoggerFactory = ProcessorFormatter = None  # type: ignore[assignment]
 
 
-_TIMESTAMER = structlog.processors.TimeStamper(fmt="iso", key="timestamp")
+if structlog is not None:
+    _TIMESTAMER = structlog.processors.TimeStamper(fmt="iso", key="timestamp")
+else:  # pragma: no cover - fallback configuration
+    _TIMESTAMER = None
 
 
 def _add_run_and_agent(
     _: BoundLogger, __: str, event_dict: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Ensure ``run_id`` and ``agent_id`` are present in every log entry."""
+
+    if get_contextvars is None:
+        return event_dict
 
     context = get_contextvars()
     if "run_id" not in event_dict or event_dict["run_id"] is None:
@@ -34,6 +45,9 @@ def _add_run_and_agent(
 def _configure_structlog() -> None:
     """Configure structlog to emit JSON events with contextual data."""
 
+    if structlog is None:
+        return
+
     structlog.configure(
         processors=[
             merge_contextvars,
@@ -49,7 +63,10 @@ def _configure_structlog() -> None:
     )
 
 
-def _build_formatter() -> ProcessorFormatter:
+def _build_formatter() -> logging.Formatter:
+    if structlog is None:
+        return logging.Formatter("%(message)s")
+
     return ProcessorFormatter(
         foreign_pre_chain=[
             merge_contextvars,
@@ -72,6 +89,16 @@ def configure_uvicorn() -> None:
 
     global _configured
     if _configured:
+        return
+
+    if structlog is None:
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO, force=True)
+        for logger_name in ("uvicorn", "uvicorn.access"):
+            logger = logging.getLogger(logger_name)
+            logger.propagate = True
+            if logger.level < logging.INFO:
+                logger.setLevel(logging.INFO)
+        _configured = True
         return
 
     _configure_structlog()

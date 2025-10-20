@@ -378,8 +378,9 @@ async def record_request_latency(
     ).observe(duration)
     return response
 
-def _require_schema_v1(schema_value: str) -> None:
-    if schema_value != SCHEMA_V1:
+def _require_schema_v1(schema_value: SchemaVersion | str) -> None:
+    value = schema_value.value if isinstance(schema_value, SchemaVersion) else schema_value
+    if value != SCHEMA_V1:
         raise HTTPException(status_code=400, detail="unsupported schema version")
 
 
@@ -845,7 +846,7 @@ async def ingest_run_event(
     if record is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    _require_schema_v1(event.schema)
+    _require_schema_v1(event.schema_version)
     event_payload_model = event.payload
     if event_payload_model.kind != "simulated":
         return JSONResponse(status_code=400, content={"error": "non-simulated event rejected"})
@@ -921,7 +922,7 @@ async def record_run_response(
     if not record_exists and not await _path_exists(run_dir):
         raise HTTPException(status_code=404, detail="Run not found")
 
-    _require_schema_v1(response.schema)
+    _require_schema_v1(response.schema_version)
     response_payload_model = response.payload
     response_payload = _sanitize_payload_strings(
         json.loads(response_payload_model.json(exclude_none=True))

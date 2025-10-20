@@ -86,19 +86,28 @@ class Detection(BaseModel):
 class VersionedEventIn(BaseModel):
     """Schema version envelope for event ingestion."""
 
-    schema: str
+    schema_version: SchemaVersion = Field(..., alias="schema")
     payload: EventInV1
+
+    class Config:
+        allow_population_by_field_name = True
 
 
 class VersionedResponseIn(BaseModel):
     """Schema version envelope for blue team responses."""
 
-    schema: str
+    schema_version: SchemaVersion = Field(..., alias="schema")
     payload: ResponseInV1
+
+    class Config:
+        allow_population_by_field_name = True
 
 
 class VersionedDetections(BaseModel):
     """Schema version envelope for detections responses."""
 
-    schema: str
+    schema_version: SchemaVersion = Field(..., alias="schema")
     payload: List[Detection]
+
+    class Config:
+        allow_population_by_field_name = True
