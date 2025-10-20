@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
+from . import detector
+
 try:  # Optional dependency used to parse scenario YAML.
     import yaml  # type: ignore
 except Exception:  # pragma: no cover - PyYAML may be absent in some environments.
@@ -76,6 +78,22 @@ def run_events_path(run_id: str) -> Path:
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir / "events.json"
+
+
+def run_responses_path(run_id: str) -> Path:
+    """Return the filesystem path for storing response actions for a run."""
+
+    run_dir = RUNS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir / "responses.jsonl"
+
+
+def run_policy_path(run_id: str) -> Path:
+    """Return the filesystem path for storing run policy state."""
+
+    run_dir = RUNS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir / "policy.json"
 
 
 def append_event(record: RunRecord, event: Dict[str, Any]) -> None:
@@ -295,8 +313,54 @@ async def ingest_run_event(run_id: str, event: Dict[str, Any] = Body(...)) -> Di
     if event.get("kind") != "simulated":
         return JSONResponse(status_code=400, content={"error": "non-simulated event rejected"})
 
-    append_event(record, {"type": "agent_event", "run_id": run_id, **event})
+    enriched_event = {"type": "agent_event", "run_id": run_id, **event}
+    append_event(record, enriched_event)
+    detector.process_event_for_detections(enriched_event)
     return {"status": "accepted"}
+
+
+@app.get("/runs/{run_id}/detections", summary="Run detections")
+async def run_detections(run_id: str, since_ts: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return detections generated for a run."""
+
+    async with runs_lock:
+        record_exists = run_id in runs
+    run_dir = RUNS_DIR / run_id
+    if not record_exists and not run_dir.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    return detector.get_detections_since(run_id, since_ts)
+
+
+@app.post("/runs/{run_id}/responses", summary="Record response action")
+async def record_run_response(run_id: str, response: Dict[str, Any] = Body(...)) -> Dict[str, str]:
+    """Persist a blue-team style response associated with a run."""
+
+    async with runs_lock:
+        record_exists = run_id in runs
+    run_dir = RUNS_DIR / run_id
+    if not record_exists and not run_dir.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    responses_path = run_responses_path(run_id)
+    responses_path.parent.mkdir(parents=True, exist_ok=True)
+    with responses_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(response) + "\n")
+
+    policy_changes = response.get("apply_policy_changes")
+    if isinstance(policy_changes, dict):
+        policy_path = run_policy_path(run_id)
+        if policy_path.exists():
+            try:
+                existing_policy = json.loads(policy_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                existing_policy = {}
+        else:
+            existing_policy = {}
+        existing_policy.update(policy_changes)
+        policy_path.write_text(json.dumps(existing_policy, indent=2, sort_keys=True), encoding="utf-8")
+
+    return {"status": "recorded"}
 
 
 @app.get("/runs/{run_id}/next", summary="Next action")
