@@ -3,13 +3,14 @@ version: "3.9"
 networks:
   redops_net:
     driver: bridge
+    internal: true
 
 services:
   orchestrator:
     build:
       context: ../orchestrator
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
@@ -32,7 +33,7 @@ services:
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
       - xpack.security.enabled=false
     ports:
-      - "9200:9200"
+      - "127.0.0.1:9200:9200"
     volumes:
       - elastic-data:/usr/share/elasticsearch/data
     networks:
@@ -48,7 +49,7 @@ services:
   kibana:
     image: docker.elastic.co/kibana/kibana:8.13.0
     ports:
-      - "5601:5601"
+      - "127.0.0.1:5601:5601"
     environment:
       - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
     depends_on:
@@ -62,8 +63,8 @@ services:
     environment:
       - NEO4J_AUTH=none
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
     volumes:
       - neo4j-data:/data
     networks:
@@ -72,7 +73,7 @@ services:
   juice-shop:
     image: bkimminich/juice-shop
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     networks:
       - redops_net
     # Official OWASP Juice Shop image for controlled vulnerability simulations.
@@ -81,7 +82,7 @@ services:
     build:
       context: ./vuln-service
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     networks:
       - redops_net
     # Intentionally vulnerable file upload service for lab testing only.
