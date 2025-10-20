@@ -9,17 +9,18 @@ import contextlib
 import json
 import logging
 import signal
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Optional
 
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import detector
-from .jobs import BatchWriter, JobBus, QueueFullError
+from . import detector, metrics
+from .jobs import BatchWriter, JobBus, QueueFullError, _DEFAULT_TIMEOUT
 from .logging_config import configure_uvicorn
 from .schemas import (
     Detection,
@@ -72,9 +73,77 @@ worker_task: Optional[asyncio.Task[None]] = None
 runs: Dict[str, RunRecord] = {}
 runs_lock = asyncio.Lock()
 
-JOB_BUS = JobBus()
-BATCH_WRITER = BatchWriter(JOB_BUS, RUNS_DIR)
+class InstrumentedJobBus(JobBus):
+    async def put_event(
+        self,
+        run_id: str,
+        event: Dict[str, object],
+        *,
+        timeout: Optional[float] | object = _DEFAULT_TIMEOUT,
+    ) -> bool:
+        success = await super().put_event(run_id, event, timeout=timeout)
+        if success:
+            queue = self._queues.get(run_id)
+            depth = queue.qsize() if queue is not None else 0
+            metrics.set_queue_depth(run_id, depth)
+        return success
+
+    async def get_event(self, run_id: str) -> AsyncIterator[Dict[str, object]]:
+        queue = self._ensure_queue(run_id)
+        try:
+            while True:
+                event = await queue.get()
+                metrics.set_queue_depth(run_id, queue.qsize())
+                yield event
+        finally:
+            pass
+
+
+class InstrumentedBatchWriter(BatchWriter):
+    async def _flush(
+        self,
+        run_id: str,
+        events: Iterable[Dict[str, object]],
+        max_bytes: int,
+    ) -> None:
+        event_list = list(events)
+        if not event_list:
+            return
+        try:
+            await super()._flush(run_id, event_list, max_bytes)
+            metrics.record_write_success()
+        except Exception:
+            metrics.record_write_error()
+            raise
+
+
+JOB_BUS = InstrumentedJobBus()
+BATCH_WRITER = InstrumentedBatchWriter(JOB_BUS, RUNS_DIR)
 SHUTDOWN_TRIGGERED = asyncio.Event()
+
+
+@app.middleware("http")
+async def record_request_latency(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+):
+    """Observe request latency for all inbound HTTP traffic."""
+
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration = time.perf_counter() - start
+        metrics.REQUEST_LATENCY_SECONDS.labels(
+            method=request.method,
+            endpoint=request.url.path,
+        ).observe(duration)
+        raise
+    duration = time.perf_counter() - start
+    metrics.REQUEST_LATENCY_SECONDS.labels(
+        method=request.method,
+        endpoint=request.url.path,
+    ).observe(duration)
+    return response
 
 def _require_schema_v1(schema_value: str) -> None:
     if schema_value != SCHEMA_V1:
@@ -397,6 +466,14 @@ async def shutdown_event() -> None:
     await _initiate_shutdown("lifespan")
 
 
+@app.get("/metrics", summary="Prometheus metrics")
+def metrics_endpoint() -> Response:
+    """Expose Prometheus-formatted metrics for scraping."""
+
+    payload = metrics.latest()
+    return Response(content=payload, media_type=metrics.CONTENT_TYPE_LATEST)
+
+
 @app.post("/scenarios", summary="Create a scenario")
 async def create_scenario(body: str = Body(..., media_type="text/plain")) -> Dict[str, str]:
     """Persist an uploaded scenario definition and return its identifier."""
@@ -429,6 +506,7 @@ async def schedule_run(scenario_id: str) -> Dict[str, Any]:
     )
     async with runs_lock:
         runs[run_id] = record
+    metrics.set_queue_depth(run_id, 0)
     await append_event(record, {"type": "run_created", "run_id": run_id, "scenario_id": scenario_id})
     await job_queue.put(run_id)
     return {"run_id": run_id, "status": record.status}
@@ -505,7 +583,10 @@ async def ingest_run_event(run_id: str, event: VersionedEventIn) -> JSONResponse
         enriched_event = await enqueue_run_event(run_id, payload, timeout=0)
     except QueueFullError as exc:
         raise HTTPException(status_code=429, detail="queue full") from exc
-    detector.process_event_for_detections(enriched_event)
+    metrics.record_event(run_id)
+    with metrics.track_request_latency("internal", "detections"):
+        detections = detector.process_event_for_detections(enriched_event)
+    metrics.record_detections(run_id, len(detections))
     return JSONResponse(status_code=202, content=_wrap_payload({"status": "enqueued"}))
 
 
