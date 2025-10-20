@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+LAB_MODE = True
+
 import asyncio
 import contextlib
 import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,11 +15,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import Body, FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 try:  # Optional dependency used to parse scenario YAML.
     import yaml  # type: ignore
 except Exception:  # pragma: no cover - PyYAML may be absent in some environments.
     yaml = None  # type: ignore
+
+LOGGER = logging.getLogger("redops.orchestrator")
 
 app = FastAPI(
     title="RedOps Orchestrator",
@@ -187,6 +193,7 @@ async def startup_event() -> None:
     """Initialise directories and launch the background worker."""
 
     ensure_directories()
+    LOGGER.info("RedOps orchestrator running in LAB MODE (local only)")
     global worker_task
     worker_task = asyncio.create_task(run_worker())
 
@@ -274,6 +281,22 @@ async def run_events(run_id: str) -> Dict[str, Any]:
                     except json.JSONDecodeError:
                         events.append({"raw": line})
     return {"run_id": run_id, "events": events}
+
+
+@app.post("/runs/{run_id}/events", summary="Ingest run event")
+async def ingest_run_event(run_id: str, event: Dict[str, Any] = Body(...)) -> Dict[str, str]:
+    """Record an externally produced event for a run."""
+
+    async with runs_lock:
+        record = runs.get(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if event.get("kind") != "simulated":
+        return JSONResponse(status_code=400, content={"error": "non-simulated event rejected"})
+
+    append_event(record, {"type": "agent_event", "run_id": run_id, **event})
+    return {"status": "accepted"}
 
 
 @app.get("/runs/{run_id}/next", summary="Next action")
