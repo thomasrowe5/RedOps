@@ -62,6 +62,16 @@ RedOps is a research-oriented platform for experimenting with defensive automati
 ## Safety Note
 This project is designed strictly for isolated lab environments. Do **not** expose RedOps components, data stores, or intentionally vulnerable services to production networks or untrusted users.
 
+## RL Extension
+- **Goal:** Train reinforcement learning policies that refine simulated adversary playbooks to progress missions while suppressing defensive telemetry in the lab.
+- **Safety:** Runs stay confined to the orchestrated sandbox with existing approval workflows, scenario gating, and audit logging.
+- **Compute Footprint:** CPU-only baseline; a 16 vCPU, 32 GB RAM node completes the default `total_timesteps=200000` configuration in roughly 2.5 hours.
+- **Quick Reproduction:**
+  1. `docker compose -f lab/docker-compose.yml up -d`
+  2. `uvicorn orchestrator.app.main:app --reload`
+  3. `python analysis/train_loop.py --config analysis/experiment_config.yaml --seed 42`
+- **Hardware Notes:** Keep CPU frequency scaling steady and use SSD-backed storage to avoid I/O stalls during checkpoint logging.
+
 ## Recommended Next Steps for Research Publication
 ### Experiments
 - **Automated Detection Efficacy:** Run controlled attack simulations with varying tactics to benchmark how quickly and accurately detections trigger.

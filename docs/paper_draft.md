@@ -29,3 +29,13 @@ We present an AI-guided adversary simulation platform that integrates autonomous
 
 ## Reproducibility Statement
 All experiments rely on containerized lab topologies, versioned agent configurations, and scripted deployment playbooks. Beam search parameters, scoring weights, and policy definitions are logged per run, enabling independent reproduction of results given equivalent infrastructure.
+
+## RL Extension
+- **Goal:** Evaluate reinforcement learning policies that adapt orchestrated attack sequences to maximize mission progression while minimizing detection signals across simulated enterprise labs.
+- **Safety:** Training runs inherit the platform's isolation guarantees—policies interact only with sandboxed lab services, and scenario gating plus audit logging remain enforced throughout experimentation.
+- **Compute Footprint:** CPU-only execution; validated on a 16 vCPU, 32 GB RAM host where the default `total_timesteps=200000` run completes in approximately 2.5 hours.
+- **Reproducibility Commands:**
+  1. `docker compose -f lab/docker-compose.yml up -d`
+  2. `uvicorn orchestrator.app.main:app --reload`
+  3. `python analysis/train_loop.py --config analysis/experiment_config.yaml --seed 42`
+- **Hardware Notes:** Prioritize consistent CPU frequency scaling (disable aggressive power saving) to ensure stable episode timing; SSD-backed storage is recommended for log ingestion bursts during training checkpoints.
