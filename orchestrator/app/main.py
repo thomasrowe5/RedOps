@@ -8,14 +8,15 @@ import asyncio
 import contextlib
 import json
 import logging
+import signal
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
-from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import detector
 from .jobs import BatchWriter, JobBus, QueueFullError
@@ -41,6 +42,10 @@ DATA_DIR = BASE_DIR / "data"
 SCENARIOS_DIR = DATA_DIR / "scenarios"
 RUNS_DIR = DATA_DIR / "runs"
 
+IO_TIMEOUT_SECONDS = 5.0
+BACKOFF_MAX_ATTEMPTS = 5
+BACKOFF_BASE_DELAY = 0.05
+
 
 @dataclass
 class RunRecord:
@@ -62,13 +67,14 @@ runs_lock = asyncio.Lock()
 
 JOB_BUS = JobBus()
 BATCH_WRITER = BatchWriter(JOB_BUS, RUNS_DIR)
+SHUTDOWN_TRIGGERED = asyncio.Event()
 
 
-def ensure_directories() -> None:
+async def ensure_directories() -> None:
     """Create the directories required for storing scenarios and run artifacts."""
 
-    SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    await _mkdir_with_timeout(SCENARIOS_DIR)
+    await _mkdir_with_timeout(RUNS_DIR)
 
 
 def scenario_path_from_id(scenario_id: str) -> Path:
@@ -77,28 +83,145 @@ def scenario_path_from_id(scenario_id: str) -> Path:
     return SCENARIOS_DIR / f"{scenario_id}.yaml"
 
 
-def run_events_path(run_id: str) -> Path:
+async def run_events_path(run_id: str) -> Path:
     """Return the filesystem path for storing JSON events for a run."""
 
-    run_dir = RUNS_DIR / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = await _ensure_run_dir(run_id)
     return run_dir / "events.ndjson"
 
 
-def run_responses_path(run_id: str) -> Path:
+async def run_responses_path(run_id: str) -> Path:
     """Return the filesystem path for storing response actions for a run."""
 
-    run_dir = RUNS_DIR / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = await _ensure_run_dir(run_id)
     return run_dir / "responses.jsonl"
 
 
-def run_policy_path(run_id: str) -> Path:
+async def run_policy_path(run_id: str) -> Path:
     """Return the filesystem path for storing run policy state."""
 
-    run_dir = RUNS_DIR / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = await _ensure_run_dir(run_id)
     return run_dir / "policy.json"
+
+
+async def _mkdir_with_timeout(path: Path) -> None:
+    async with asyncio.timeout(IO_TIMEOUT_SECONDS):
+        await asyncio.to_thread(path.mkdir, parents=True, exist_ok=True)
+
+
+async def _ensure_run_dir(run_id: str) -> Path:
+    run_dir = RUNS_DIR / run_id
+    await _mkdir_with_timeout(run_dir)
+    return run_dir
+
+
+async def _path_exists(path: Path) -> bool:
+    async with asyncio.timeout(IO_TIMEOUT_SECONDS):
+        return await asyncio.to_thread(path.exists)
+
+
+async def _read_text(path: Path) -> str:
+    async with asyncio.timeout(IO_TIMEOUT_SECONDS):
+        return await asyncio.to_thread(path.read_text, encoding="utf-8")
+
+
+async def _write_with_backoff(operation: Callable[[], None]) -> None:
+    delay = BACKOFF_BASE_DELAY
+    last_error: Optional[Exception] = None
+    for attempt in range(1, BACKOFF_MAX_ATTEMPTS + 1):
+        try:
+            async with asyncio.timeout(IO_TIMEOUT_SECONDS):
+                await asyncio.to_thread(operation)
+            return
+        except Exception as exc:  # pragma: no cover - safety net
+            last_error = exc
+            if attempt == BACKOFF_MAX_ATTEMPTS:
+                raise
+            await asyncio.sleep(delay)
+            delay *= 2
+    if last_error:
+        raise last_error
+
+
+async def _write_text(path: Path, content: str) -> None:
+    await _write_with_backoff(lambda: path.write_text(content, encoding="utf-8"))
+
+
+async def _append_text(path: Path, content: str) -> None:
+    def _writer() -> None:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(content)
+
+    await _write_with_backoff(_writer)
+
+
+async def _read_ndjson(path: Path) -> List[Dict[str, Any]]:
+    if not await _path_exists(path):
+        return []
+    raw = await _read_text(path)
+    events: List[Dict[str, Any]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            events.append({"raw": line})
+    return events
+
+
+def _encode_sse_event(payload: Dict[str, Any]) -> bytes:
+    data = json.dumps(payload, sort_keys=True)
+    return f"data: {data}\n\n".encode("utf-8")
+
+
+async def _tail_events_stream(path: Path, start_index: int) -> AsyncIterator[bytes]:
+    last_index = max(0, start_index)
+    keepalive_counter = 0
+    try:
+        while not SHUTDOWN_TRIGGERED.is_set():
+            events = await _read_ndjson(path)
+            if last_index < len(events):
+                for event in events[last_index:]:
+                    yield _encode_sse_event(event)
+                last_index = len(events)
+                keepalive_counter = 0
+            else:
+                keepalive_counter += 1
+                if keepalive_counter >= 15:
+                    yield b": keep-alive\n\n"
+                    keepalive_counter = 0
+            await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
+        raise
+
+
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
+    for signame in ("SIGINT", "SIGTERM"):
+        signum = getattr(signal, signame, None)
+        if signum is None:
+            continue
+        try:
+            loop.add_signal_handler(
+                signum,
+                lambda s=signame: loop.create_task(_initiate_shutdown(s)),
+            )
+        except NotImplementedError:  # pragma: no cover - platform dependent
+            LOGGER.debug("Signal handler %s not supported on this platform", signame)
+
+
+async def _initiate_shutdown(reason: Optional[str] = None) -> None:
+    if SHUTDOWN_TRIGGERED.is_set():
+        return
+    SHUTDOWN_TRIGGERED.set()
+    LOGGER.info("Initiating graceful shutdown%s", f" ({reason})" if reason else "")
+    global worker_task
+    if worker_task is not None:
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+        worker_task = None
+    await BATCH_WRITER.shutdown()
 
 
 async def enqueue_run_event(
@@ -163,7 +286,10 @@ async def run_worker() -> None:
     """Background worker processing queued run executions."""
 
     while True:
-        run_id = await job_queue.get()
+        try:
+            run_id = await job_queue.get()
+        except asyncio.CancelledError:
+            break
         try:
             async with runs_lock:
                 record = runs.get(run_id)
@@ -174,7 +300,7 @@ async def run_worker() -> None:
 
             scenario_file = scenario_path_from_id(record.scenario_id)
             try:
-                scenario_body = scenario_file.read_text(encoding="utf-8")
+                scenario_body = await _read_text(scenario_file)
             except FileNotFoundError:
                 async with runs_lock:
                     record.status = "error"
@@ -223,37 +349,44 @@ async def run_worker() -> None:
         finally:
             job_queue.task_done()
 
+    while True:
+        try:
+            job_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        else:
+            job_queue.task_done()
+
 
 @app.on_event("startup")
 async def startup_event() -> None:
     """Initialise directories and launch the background worker."""
 
-    ensure_directories()
+    SHUTDOWN_TRIGGERED.clear()
+    await ensure_directories()
     LOGGER.info("RedOps orchestrator running in LAB MODE (local only)")
     BATCH_WRITER.start()
     global worker_task
     worker_task = asyncio.create_task(run_worker())
+    loop = asyncio.get_running_loop()
+    _install_signal_handlers(loop)
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
     """Cancel the background worker on application shutdown."""
 
-    if worker_task is not None:
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
-    await BATCH_WRITER.shutdown()
+    await _initiate_shutdown("lifespan")
 
 
 @app.post("/scenarios", summary="Create a scenario")
 async def create_scenario(body: str = Body(..., media_type="text/plain")) -> Dict[str, str]:
     """Persist an uploaded scenario definition and return its identifier."""
 
-    ensure_directories()
+    await ensure_directories()
     scenario_id = uuid.uuid4().hex
     path = scenario_path_from_id(scenario_id)
-    path.write_text(body, encoding="utf-8")
+    await _write_text(path, body)
     return {"scenario_id": scenario_id}
 
 
@@ -262,14 +395,14 @@ async def schedule_run(scenario_id: str) -> Dict[str, Any]:
     """Schedule execution of a stored scenario and return the run identifier."""
 
     scenario_file = scenario_path_from_id(scenario_id)
-    if not scenario_file.exists():
+    if not await _path_exists(scenario_file):
         raise HTTPException(status_code=404, detail="Scenario not found")
 
     run_id = uuid.uuid4().hex
-    events_path = run_events_path(run_id)
-    events_path.write_text("", encoding="utf-8")
+    events_path = await run_events_path(run_id)
+    await _write_text(events_path, "")
     legacy_events_path = events_path.with_suffix(".json")
-    legacy_events_path.write_text("", encoding="utf-8")
+    await _write_text(legacy_events_path, "")
     record = RunRecord(
         run_id=run_id,
         scenario_id=scenario_id,
@@ -303,25 +436,35 @@ async def run_status(run_id: str) -> Dict[str, Any]:
 
 
 @app.get("/runs/{run_id}/events", summary="Run events")
-async def run_events(run_id: str) -> Dict[str, Any]:
-    """Return the stored events for a run as a list of JSON objects."""
+async def run_events(
+    run_id: str,
+    offset: int = Query(0, ge=0),
+    limit: Optional[int] = Query(100, ge=0),
+    tail: bool = Query(False),
+):
+    """Return stored events for a run or stream updates via server-sent events."""
 
     async with runs_lock:
         record = runs.get(run_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Run not found")
         events_file = record.events_path
-    events: List[Dict[str, Any]] = []
-    if events_file.exists():
-        with events_file.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    try:
-                        events.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        events.append({"raw": line})
-    return {"run_id": run_id, "events": events}
+
+    if tail:
+        stream = _tail_events_stream(events_file, offset)
+        return StreamingResponse(stream, media_type="text/event-stream")
+
+    events = await _read_ndjson(events_file)
+    total = len(events)
+    end = offset + limit if limit is not None else None
+    sliced = events[offset:end]
+    return {
+        "run_id": run_id,
+        "events": sliced,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 @app.post("/runs/{run_id}/events", summary="Ingest run event")
@@ -351,7 +494,7 @@ async def run_queue_stats(run_id: str) -> Dict[str, int]:
 
     async with runs_lock:
         record_exists = run_id in runs
-    if not record_exists and not (RUNS_DIR / run_id).exists():
+    if not record_exists and not await _path_exists(RUNS_DIR / run_id):
         raise HTTPException(status_code=404, detail="Run not found")
 
     depth = JOB_BUS.stats().get(run_id, 0)
@@ -365,7 +508,7 @@ async def run_detections(run_id: str, since_ts: Optional[str] = None) -> List[Di
     async with runs_lock:
         record_exists = run_id in runs
     run_dir = RUNS_DIR / run_id
-    if not record_exists and not run_dir.exists():
+    if not record_exists and not await _path_exists(run_dir):
         raise HTTPException(status_code=404, detail="Run not found")
 
     return detector.get_detections_since(run_id, since_ts)
@@ -378,26 +521,27 @@ async def record_run_response(run_id: str, response: Dict[str, Any] = Body(...))
     async with runs_lock:
         record_exists = run_id in runs
     run_dir = RUNS_DIR / run_id
-    if not record_exists and not run_dir.exists():
+    if not record_exists and not await _path_exists(run_dir):
         raise HTTPException(status_code=404, detail="Run not found")
 
-    responses_path = run_responses_path(run_id)
-    responses_path.parent.mkdir(parents=True, exist_ok=True)
-    with responses_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(response) + "\n")
+    responses_path = await run_responses_path(run_id)
+    await _append_text(responses_path, json.dumps(response) + "\n")
 
     policy_changes = response.get("apply_policy_changes")
     if isinstance(policy_changes, dict):
-        policy_path = run_policy_path(run_id)
-        if policy_path.exists():
+        policy_path = await run_policy_path(run_id)
+        if await _path_exists(policy_path):
             try:
-                existing_policy = json.loads(policy_path.read_text(encoding="utf-8"))
+                existing_policy = json.loads(await _read_text(policy_path))
             except json.JSONDecodeError:
                 existing_policy = {}
         else:
             existing_policy = {}
         existing_policy.update(policy_changes)
-        policy_path.write_text(json.dumps(existing_policy, indent=2, sort_keys=True), encoding="utf-8")
+        await _write_text(
+            policy_path,
+            json.dumps(existing_policy, indent=2, sort_keys=True),
+        )
 
     return {"status": "recorded"}
 
