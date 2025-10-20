@@ -6,6 +6,7 @@ LAB_MODE = True
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import os
@@ -40,6 +41,12 @@ except Exception:  # pragma: no cover - PyYAML may be absent in some environment
 
 LOGGER = logging.getLogger("redops.orchestrator")
 
+_ALLOWED_SUBNETS = (
+    ipaddress.ip_network("127.0.0.1/32"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("172.16.0.0/12"),
+)
+
 app = FastAPI(
     title="RedOps Orchestrator",
     version="0.2.0",
@@ -57,6 +64,16 @@ RUNS_DIR = DATA_DIR / "runs"
 IO_TIMEOUT_SECONDS = 5.0
 BACKOFF_MAX_ATTEMPTS = 5
 BACKOFF_BASE_DELAY = 0.05
+
+
+@app.middleware("http")
+async def _enforce_lab_mode(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    if LAB_MODE:
+        client_host = request.client.host if request.client else None
+        if client_host and not _is_host_allowed(client_host):
+            LOGGER.warning("Denied request from disallowed host %s", client_host)
+            raise HTTPException(status_code=403, detail="LAB MODE: external access prohibited")
+    return await call_next(request)
 
 
 @dataclass
@@ -171,6 +188,14 @@ def _get_env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def _is_host_allowed(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(address in subnet for subnet in _ALLOWED_SUBNETS)
 
 
 MAX_POST_BYTES = 64 * 1024
@@ -601,10 +626,15 @@ async def run_worker() -> None:
 async def startup_event() -> None:
     """Initialise directories and launch the background worker."""
 
+    if not LAB_MODE:
+        raise RuntimeError("LAB_MODE must remain enabled for orchestrator startup")
+    env_lab_mode = os.getenv("LAB_MODE", "1").strip().lower()
+    if env_lab_mode in {"0", "false", "no"}:
+        raise RuntimeError("LAB_MODE environment variable must be enabled for lab operation")
     configure_uvicorn()
     SHUTDOWN_TRIGGERED.clear()
     await ensure_directories()
-    LOGGER.info("RedOps orchestrator running in LAB MODE (local only)")
+    LOGGER.info("LAB MODE enforced: external egress disabled")
     BATCH_WRITER.start()
     global worker_task
     worker_task = asyncio.create_task(run_worker())
