@@ -24,7 +24,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import detector, metrics
-from .auth import ALLOWED_ROLES, create_token, require_roles
+from .audit import verify_audit, write_audit
+from .auth import ALLOWED_ROLES, Actor, create_token, require_roles
 from .jobs import BatchWriter, JobBus, QueueFullError, _DEFAULT_TIMEOUT
 from .logging_config import configure_uvicorn
 from .schemas import (
@@ -777,9 +778,12 @@ async def run_events(
 @app.post(
     "/runs/{run_id}/events",
     summary="Ingest run event",
-    dependencies=[Depends(require_roles("agent_red", "agent_blue"))],
 )
-async def ingest_run_event(run_id: str, event: VersionedEventIn) -> JSONResponse:
+async def ingest_run_event(
+    run_id: str,
+    event: VersionedEventIn,
+    actor: Actor = Depends(require_roles("agent_red", "agent_blue")),
+) -> JSONResponse:
     """Record an externally produced event for a run."""
 
     async with runs_lock:
@@ -799,6 +803,7 @@ async def ingest_run_event(run_id: str, event: VersionedEventIn) -> JSONResponse
     except QueueFullError as exc:
         raise HTTPException(status_code=429, detail="queue full") from exc
     metrics.record_event(run_id)
+    await write_audit(run_id, actor.name, "event_ingested", payload)
     with metrics.track_request_latency("internal", "detections"):
         detections = detector.process_event_for_detections(enriched_event)
     metrics.record_detections(run_id, len(detections))
@@ -843,9 +848,12 @@ async def run_detections(run_id: str, since_ts: Optional[str] = None) -> Dict[st
 @app.post(
     "/runs/{run_id}/responses",
     summary="Record response action",
-    dependencies=[Depends(require_roles("agent_red", "agent_blue"))],
 )
-async def record_run_response(run_id: str, response: VersionedResponseIn) -> Dict[str, Any]:
+async def record_run_response(
+    run_id: str,
+    response: VersionedResponseIn,
+    actor: Actor = Depends(require_roles("agent_red", "agent_blue")),
+) -> Dict[str, Any]:
     """Persist a blue-team style response associated with a run."""
 
     async with runs_lock:
@@ -877,7 +885,25 @@ async def record_run_response(run_id: str, response: VersionedResponseIn) -> Dic
             json.dumps(existing_policy, indent=2, sort_keys=True),
         )
 
+    await write_audit(run_id, actor.name, "response_recorded", response_payload)
+
     return _wrap_payload({"status": "recorded"})
+
+
+@app.get(
+    "/runs/{run_id}/audit/verify",
+    summary="Verify run audit log",
+    dependencies=[Depends(require_roles("operator"))],
+)
+async def audit_verify(run_id: str) -> Dict[str, bool]:
+    async with runs_lock:
+        record_exists = run_id in runs
+    run_dir = RUNS_DIR / run_id
+    if not record_exists and not await _path_exists(run_dir):
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    ok = await verify_audit(run_id)
+    return {"ok": ok}
 
 
 @app.get("/runs/{run_id}/next", summary="Next action")
