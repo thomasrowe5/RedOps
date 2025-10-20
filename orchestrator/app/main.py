@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import detector
 from .jobs import BatchWriter, JobBus, QueueFullError
+from .logging_config import configure_uvicorn
 from .schemas import (
     Detection,
     SchemaVersion,
@@ -378,6 +379,7 @@ async def run_worker() -> None:
 async def startup_event() -> None:
     """Initialise directories and launch the background worker."""
 
+    configure_uvicorn()
     SHUTDOWN_TRIGGERED.clear()
     await ensure_directories()
     LOGGER.info("RedOps orchestrator running in LAB MODE (local only)")
