@@ -8,13 +8,14 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import signal
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Optional, Protocol
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -73,7 +74,7 @@ worker_task: Optional[asyncio.Task[None]] = None
 runs: Dict[str, RunRecord] = {}
 runs_lock = asyncio.Lock()
 
-class InstrumentedJobBus(JobBus):
+class JobBusProtocol(Protocol):
     async def put_event(
         self,
         run_id: str,
@@ -81,22 +82,41 @@ class InstrumentedJobBus(JobBus):
         *,
         timeout: Optional[float] | object = _DEFAULT_TIMEOUT,
     ) -> bool:
-        success = await super().put_event(run_id, event, timeout=timeout)
+        ...
+
+    async def get_event(self, run_id: str) -> AsyncIterator[Dict[str, object]]:
+        ...
+
+    def stats(self) -> Dict[str, int]:
+        ...
+
+
+class InstrumentedJobBus:
+    def __init__(self, bus: JobBusProtocol) -> None:
+        self._bus = bus
+
+    async def put_event(
+        self,
+        run_id: str,
+        event: Dict[str, object],
+        *,
+        timeout: Optional[float] | object = _DEFAULT_TIMEOUT,
+    ) -> bool:
+        success = await self._bus.put_event(run_id, event, timeout=timeout)
         if success:
-            queue = self._queues.get(run_id)
-            depth = queue.qsize() if queue is not None else 0
-            metrics.set_queue_depth(run_id, depth)
+            metrics.set_queue_depth(run_id, self.stats().get(run_id, 0))
         return success
 
     async def get_event(self, run_id: str) -> AsyncIterator[Dict[str, object]]:
-        queue = self._ensure_queue(run_id)
-        try:
-            while True:
-                event = await queue.get()
-                metrics.set_queue_depth(run_id, queue.qsize())
-                yield event
-        finally:
-            pass
+        async for event in self._bus.get_event(run_id):
+            metrics.set_queue_depth(run_id, self.stats().get(run_id, 0))
+            yield event
+
+    def stats(self) -> Dict[str, int]:
+        return self._bus.stats()
+
+    def __getattr__(self, item: str) -> Any:  # pragma: no cover - passthrough helper
+        return getattr(self._bus, item)
 
 
 class InstrumentedBatchWriter(BatchWriter):
@@ -116,8 +136,22 @@ class InstrumentedBatchWriter(BatchWriter):
             metrics.record_write_error()
             raise
 
+# Job bus selection -------------------------------------------------------
 
-JOB_BUS = InstrumentedJobBus()
+
+def _create_job_bus() -> InstrumentedJobBus:
+    driver = os.getenv("REDOPS_QUEUE_DRIVER", "memory").strip().lower()
+    base_bus: JobBusProtocol
+    if driver == "redis":
+        from .redis_bus import RedisBus
+
+        base_bus = RedisBus()
+    else:
+        base_bus = JobBus()
+    return InstrumentedJobBus(base_bus)
+
+
+JOB_BUS = _create_job_bus()
 BATCH_WRITER = InstrumentedBatchWriter(JOB_BUS, RUNS_DIR)
 SHUTDOWN_TRIGGERED = asyncio.Event()
 
