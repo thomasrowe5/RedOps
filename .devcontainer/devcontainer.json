@@ -1,0 +1,8 @@
+{
+  "name": "RedOps Dev",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "postCreateCommand": "pip install -r orchestrator/requirements.txt || true && pip install pytest ruff mypy black bandit"
+}
