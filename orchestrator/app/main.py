@@ -6,6 +6,8 @@ LAB_MODE = True
 
 import asyncio
 import contextlib
+import html
+import ipaddress
 import json
 import logging
 import os
@@ -17,13 +19,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Optional, Protocol
 from typing import Tuple
+import re
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import detector, metrics
-from .auth import ALLOWED_ROLES, create_token, require_roles
+from .audit import verify_audit, write_audit
+from .auth import ALLOWED_ROLES, Actor, create_token, require_roles
 from .jobs import BatchWriter, JobBus, QueueFullError, _DEFAULT_TIMEOUT
 from .logging_config import configure_uvicorn
 from .schemas import (
@@ -39,6 +43,12 @@ except Exception:  # pragma: no cover - PyYAML may be absent in some environment
     yaml = None  # type: ignore
 
 LOGGER = logging.getLogger("redops.orchestrator")
+
+_ALLOWED_SUBNETS = (
+    ipaddress.ip_network("127.0.0.1/32"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("172.16.0.0/12"),
+)
 
 app = FastAPI(
     title="RedOps Orchestrator",
@@ -59,6 +69,16 @@ BACKOFF_MAX_ATTEMPTS = 5
 BACKOFF_BASE_DELAY = 0.05
 
 
+@app.middleware("http")
+async def _enforce_lab_mode(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    if LAB_MODE:
+        client_host = request.client.host if request.client else None
+        if client_host and not _is_host_allowed(client_host):
+            LOGGER.warning("Denied request from disallowed host %s", client_host)
+            raise HTTPException(status_code=403, detail="LAB MODE: external access prohibited")
+    return await call_next(request)
+
+
 @dataclass
 class RunRecord:
     """In-memory representation of a scheduled run."""
@@ -76,6 +96,7 @@ job_queue: asyncio.Queue[str] = asyncio.Queue()
 worker_task: Optional[asyncio.Task[None]] = None
 runs: Dict[str, RunRecord] = {}
 runs_lock = asyncio.Lock()
+_AGENT_LAST_TIMESTAMPS: Dict[Tuple[str, str], datetime] = {}
 
 class JobBusProtocol(Protocol):
     async def put_event(
@@ -173,6 +194,14 @@ def _get_env_float(name: str, default: float) -> float:
         return default
 
 
+def _is_host_allowed(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(address in subnet for subnet in _ALLOWED_SUBNETS)
+
+
 MAX_POST_BYTES = 64 * 1024
 RATE_LIMIT_BURST = max(0, _get_env_int("REDOPS_RATE_LIMIT_BURST", 100))
 RATE_LIMIT_RATE = max(0.0, _get_env_float("REDOPS_RATE_LIMIT_RATE", 50.0))
@@ -218,6 +247,57 @@ def _extract_agent_id(path: str, body: bytes) -> Optional[str]:
         if isinstance(agent_id, str) and agent_id.strip():
             return agent_id.strip()
     return None
+
+
+_CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x1F\x7F]")
+_SAFE_NOTE_PATTERN = re.compile(r"^[A-Za-z0-9 .,;:!?()\-_'\"/@#&]+$")
+_HTML_TAG_PATTERN = re.compile(r"<[^>]*>")
+_FREE_TEXT_FIELDS = {"note", "reason", "response"}
+
+
+def _sanitize_free_text(value: str, field_name: str) -> str:
+    stripped = _HTML_TAG_PATTERN.sub("", value)
+    if field_name == "note" and stripped and not _SAFE_NOTE_PATTERN.fullmatch(stripped):
+        raise HTTPException(status_code=400, detail="note contains unsupported characters")
+    return html.escape(stripped, quote=False)
+
+
+def _sanitize_value(field_name: str, value: Any) -> Any:
+    if isinstance(value, str):
+        if _CONTROL_CHAR_PATTERN.search(value):
+            raise HTTPException(status_code=400, detail=f"{field_name} contains control characters")
+        if field_name in _FREE_TEXT_FIELDS:
+            return _sanitize_free_text(value, field_name)
+        return value
+    if isinstance(value, dict):
+        return {key: _sanitize_value(key, item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_value(field_name, item) for item in value]
+    return value
+
+
+def _sanitize_payload_strings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: _sanitize_value(key, value) for key, value in payload.items()}
+
+
+async def _enforce_monotonic_timestamp(
+    run_id: str, agent_id: str, timestamp: datetime, actor_name: str
+) -> None:
+    key = (run_id, agent_id)
+    last_seen = _AGENT_LAST_TIMESTAMPS.get(key)
+    if last_seen is not None and timestamp < last_seen:
+        await write_audit(
+            run_id,
+            actor_name,
+            "timestamp_regression",
+            {
+                "agent_id": agent_id,
+                "observed_timestamp": timestamp.isoformat(),
+                "last_timestamp": last_seen.isoformat(),
+            },
+        )
+        return
+    _AGENT_LAST_TIMESTAMPS[key] = timestamp
 
 
 async def _consume_rate_limit_token(run_id: str, agent_id: str) -> bool:
@@ -601,10 +681,15 @@ async def run_worker() -> None:
 async def startup_event() -> None:
     """Initialise directories and launch the background worker."""
 
+    if not LAB_MODE:
+        raise RuntimeError("LAB_MODE must remain enabled for orchestrator startup")
+    env_lab_mode = os.getenv("LAB_MODE", "1").strip().lower()
+    if env_lab_mode in {"0", "false", "no"}:
+        raise RuntimeError("LAB_MODE environment variable must be enabled for lab operation")
     configure_uvicorn()
     SHUTDOWN_TRIGGERED.clear()
     await ensure_directories()
-    LOGGER.info("RedOps orchestrator running in LAB MODE (local only)")
+    LOGGER.info("LAB MODE enforced: external egress disabled")
     BATCH_WRITER.start()
     global worker_task
     worker_task = asyncio.create_task(run_worker())
@@ -747,9 +832,12 @@ async def run_events(
 @app.post(
     "/runs/{run_id}/events",
     summary="Ingest run event",
-    dependencies=[Depends(require_roles("agent_red", "agent_blue"))],
 )
-async def ingest_run_event(run_id: str, event: VersionedEventIn) -> JSONResponse:
+async def ingest_run_event(
+    run_id: str,
+    event: VersionedEventIn,
+    actor: Actor = Depends(require_roles("agent_red", "agent_blue")),
+) -> JSONResponse:
     """Record an externally produced event for a run."""
 
     async with runs_lock:
@@ -762,13 +850,19 @@ async def ingest_run_event(run_id: str, event: VersionedEventIn) -> JSONResponse
     if event_payload_model.kind != "simulated":
         return JSONResponse(status_code=400, content={"error": "non-simulated event rejected"})
 
-    event_payload = json.loads(event_payload_model.json(exclude_none=True))
+    event_payload = _sanitize_payload_strings(
+        json.loads(event_payload_model.json(exclude_none=True))
+    )
+    await _enforce_monotonic_timestamp(
+        run_id, event_payload_model.agent_id, event_payload_model.timestamp, actor.name
+    )
     payload = {"type": "agent_event", "run_id": run_id, **event_payload}
     try:
         enriched_event = await enqueue_run_event(run_id, payload, timeout=0)
     except QueueFullError as exc:
         raise HTTPException(status_code=429, detail="queue full") from exc
     metrics.record_event(run_id)
+    await write_audit(run_id, actor.name, "event_ingested", payload)
     with metrics.track_request_latency("internal", "detections"):
         detections = detector.process_event_for_detections(enriched_event)
     metrics.record_detections(run_id, len(detections))
@@ -813,9 +907,12 @@ async def run_detections(run_id: str, since_ts: Optional[str] = None) -> Dict[st
 @app.post(
     "/runs/{run_id}/responses",
     summary="Record response action",
-    dependencies=[Depends(require_roles("agent_red", "agent_blue"))],
 )
-async def record_run_response(run_id: str, response: VersionedResponseIn) -> Dict[str, Any]:
+async def record_run_response(
+    run_id: str,
+    response: VersionedResponseIn,
+    actor: Actor = Depends(require_roles("agent_red", "agent_blue")),
+) -> Dict[str, Any]:
     """Persist a blue-team style response associated with a run."""
 
     async with runs_lock:
@@ -826,12 +923,20 @@ async def record_run_response(run_id: str, response: VersionedResponseIn) -> Dic
 
     _require_schema_v1(response.schema)
     response_payload_model = response.payload
-    response_payload = json.loads(response_payload_model.json(exclude_none=True))
+    response_payload = _sanitize_payload_strings(
+        json.loads(response_payload_model.json(exclude_none=True))
+    )
+    await _enforce_monotonic_timestamp(
+        run_id,
+        response_payload_model.agent_id,
+        response_payload_model.timestamp,
+        actor.name,
+    )
 
     responses_path = await run_responses_path(run_id)
     await _append_text(responses_path, json.dumps(response_payload) + "\n")
 
-    policy_changes = response_payload_model.apply_policy_changes
+    policy_changes = response_payload.get("apply_policy_changes")
     if isinstance(policy_changes, dict):
         policy_path = await run_policy_path(run_id)
         if await _path_exists(policy_path):
@@ -847,7 +952,25 @@ async def record_run_response(run_id: str, response: VersionedResponseIn) -> Dic
             json.dumps(existing_policy, indent=2, sort_keys=True),
         )
 
+    await write_audit(run_id, actor.name, "response_recorded", response_payload)
+
     return _wrap_payload({"status": "recorded"})
+
+
+@app.get(
+    "/runs/{run_id}/audit/verify",
+    summary="Verify run audit log",
+    dependencies=[Depends(require_roles("operator"))],
+)
+async def audit_verify(run_id: str) -> Dict[str, bool]:
+    async with runs_lock:
+        record_exists = run_id in runs
+    run_dir = RUNS_DIR / run_id
+    if not record_exists and not await _path_exists(run_dir):
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    ok = await verify_audit(run_id)
+    return {"ok": ok}
 
 
 @app.get("/runs/{run_id}/next", summary="Next action")
