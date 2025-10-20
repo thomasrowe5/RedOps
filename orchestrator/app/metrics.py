@@ -6,7 +6,30 @@ import time
 from contextlib import contextmanager
 from typing import Optional
 
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+try:
+    from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    class _NoopMetric:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: D401 - simple shim
+            """Create a metric placeholder that ignores all operations."""
+
+        def labels(self, *args, **kwargs) -> "_NoopMetric":
+            return self
+
+        def inc(self, *args, **kwargs) -> None:
+            return None
+
+        def set(self, *args, **kwargs) -> None:
+            return None
+
+        def observe(self, *args, **kwargs) -> None:
+            return None
+
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
+    Counter = Gauge = Histogram = _NoopMetric
+
+    def generate_latest() -> bytes:
+        return b""
 
 __all__ = [
     "EVENTS_TOTAL",
