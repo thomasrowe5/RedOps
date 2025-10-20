@@ -62,3 +62,53 @@ jobs:
           python-version: "3.12"
       - run: pip install pytest pyyaml
       - run: pytest -k "blue" -q
+
+  security-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Bandit
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit
+      - name: Run Bandit security lint
+        run: bandit -r orchestrator agents analysis
+
+  tests-hardened:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r orchestrator/requirements.txt
+          pip install httpx pytest
+      - name: Run hardened test suite
+        run: pytest -q tests/orch tests/sec
+
+  perf-smoke:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install performance test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r orchestrator/requirements.txt
+      - name: Run performance smoke test
+        run: python tools/loadgen.py --agents 2 --eps 5 --duration 5
