@@ -17,10 +17,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Optional, Protocol
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 from . import detector, metrics
+from .auth import ALLOWED_ROLES, create_token, require_roles
 from .jobs import BatchWriter, JobBus, QueueFullError, _DEFAULT_TIMEOUT
 from .logging_config import configure_uvicorn
 from .schemas import (
@@ -500,12 +502,40 @@ async def shutdown_event() -> None:
     await _initiate_shutdown("lifespan")
 
 
-@app.get("/metrics", summary="Prometheus metrics")
+@app.get(
+    "/metrics",
+    summary="Prometheus metrics",
+    dependencies=[Depends(require_roles("operator"))],
+)
 def metrics_endpoint() -> Response:
     """Expose Prometheus-formatted metrics for scraping."""
 
     payload = metrics.latest()
     return Response(content=payload, media_type=metrics.CONTENT_TYPE_LATEST)
+
+
+if LAB_MODE:
+
+    class TokenRequest(BaseModel):
+        actor: str
+        role: str
+        expires_in: Optional[int] = 3600
+
+    @app.post("/token", summary="Issue JWT for local development")
+    def issue_token(payload: TokenRequest) -> Dict[str, str]:
+        actor = payload.actor.strip()
+        if not actor:
+            raise HTTPException(status_code=400, detail="actor is required")
+        if payload.role not in ALLOWED_ROLES:
+            raise HTTPException(status_code=400, detail="invalid role")
+        expires_in = payload.expires_in if payload.expires_in is not None else 3600
+        if expires_in <= 0:
+            raise HTTPException(status_code=400, detail="expires_in must be positive")
+        try:
+            token = create_token(actor, payload.role, expires_in=expires_in)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"token": token}
 
 
 @app.post("/scenarios", summary="Create a scenario")
@@ -597,7 +627,11 @@ async def run_events(
     }
 
 
-@app.post("/runs/{run_id}/events", summary="Ingest run event")
+@app.post(
+    "/runs/{run_id}/events",
+    summary="Ingest run event",
+    dependencies=[Depends(require_roles("agent_red", "agent_blue"))],
+)
 async def ingest_run_event(run_id: str, event: VersionedEventIn) -> JSONResponse:
     """Record an externally produced event for a run."""
 
@@ -624,7 +658,11 @@ async def ingest_run_event(run_id: str, event: VersionedEventIn) -> JSONResponse
     return JSONResponse(status_code=202, content=_wrap_payload({"status": "enqueued"}))
 
 
-@app.get("/runs/{run_id}/queue_stats", summary="Run queue stats")
+@app.get(
+    "/runs/{run_id}/queue_stats",
+    summary="Run queue stats",
+    dependencies=[Depends(require_roles("operator"))],
+)
 async def run_queue_stats(run_id: str) -> Dict[str, int]:
     """Expose the current depth of the run's event queue."""
 
@@ -655,7 +693,11 @@ async def run_detections(run_id: str, since_ts: Optional[str] = None) -> Dict[st
     return _wrap_payload(validated)
 
 
-@app.post("/runs/{run_id}/responses", summary="Record response action")
+@app.post(
+    "/runs/{run_id}/responses",
+    summary="Record response action",
+    dependencies=[Depends(require_roles("agent_red", "agent_blue"))],
+)
 async def record_run_response(run_id: str, response: VersionedResponseIn) -> Dict[str, Any]:
     """Persist a blue-team style response associated with a run."""
 
