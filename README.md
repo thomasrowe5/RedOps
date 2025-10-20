@@ -5,6 +5,17 @@ RedOps is a research-focused platform for exploring defensive automation pattern
 ## Safety Notice
 This project is for **lab use only**. Do not deploy in production or expose to untrusted networks.
 
+## Development Setup
+
+We recommend installing [pre-commit](https://pre-commit.com/) to automatically run formatters and linters before each commit:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+The configured hooks will enforce code style and run static analysis for the `agents`, `analysis`, and `orchestrator` modules.
+
 ## Orchestrator Authentication
 
 The orchestrator API now requires JWT bearer tokens for write and operational endpoints.
