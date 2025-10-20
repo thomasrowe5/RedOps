@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Optional, Protocol
+from typing import Tuple
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -156,6 +157,122 @@ def _create_job_bus() -> InstrumentedJobBus:
 JOB_BUS = _create_job_bus()
 BATCH_WRITER = InstrumentedBatchWriter(JOB_BUS, RUNS_DIR)
 SHUTDOWN_TRIGGERED = asyncio.Event()
+
+
+def _get_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _get_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+MAX_POST_BYTES = 64 * 1024
+RATE_LIMIT_BURST = max(0, _get_env_int("REDOPS_RATE_LIMIT_BURST", 100))
+RATE_LIMIT_RATE = max(0.0, _get_env_float("REDOPS_RATE_LIMIT_RATE", 50.0))
+_TOKENS_PER_SECOND = RATE_LIMIT_RATE / 60.0 if RATE_LIMIT_RATE > 0 else 0.0
+
+
+@dataclass
+class _TokenBucketState:
+    tokens: float
+    updated_at: float
+
+
+_RATE_LIMIT_BUCKETS: Dict[Tuple[str, str], _TokenBucketState] = {}
+_RATE_LIMIT_LOCK = asyncio.Lock()
+
+
+def _should_rate_limit(path: str) -> bool:
+    return path.endswith("/events") or path.endswith("/responses")
+
+
+def _extract_run_id(path: str, path_params: Dict[str, Any]) -> Optional[str]:
+    run_id = path_params.get("run_id") if isinstance(path_params, dict) else None
+    if isinstance(run_id, str) and run_id:
+        return run_id
+    segments = [segment for segment in path.strip("/").split("/") if segment]
+    if len(segments) >= 2 and segments[0] == "runs":
+        return segments[1]
+    return None
+
+
+def _extract_agent_id(path: str, body: bytes) -> Optional[str]:
+    if not _should_rate_limit(path) or not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    envelope = payload.get("payload")
+    if isinstance(envelope, dict):
+        agent_id = envelope.get("agent_id")
+        if isinstance(agent_id, str) and agent_id.strip():
+            return agent_id.strip()
+    return None
+
+
+async def _consume_rate_limit_token(run_id: str, agent_id: str) -> bool:
+    if RATE_LIMIT_BURST <= 0 or _TOKENS_PER_SECOND <= 0:
+        return True
+    key = (run_id, agent_id)
+    now = time.monotonic()
+    async with _RATE_LIMIT_LOCK:
+        bucket = _RATE_LIMIT_BUCKETS.get(key)
+        if bucket is None:
+            bucket = _TokenBucketState(tokens=float(RATE_LIMIT_BURST), updated_at=now)
+            _RATE_LIMIT_BUCKETS[key] = bucket
+        else:
+            elapsed = max(0.0, now - bucket.updated_at)
+            bucket.tokens = min(float(RATE_LIMIT_BURST), bucket.tokens + elapsed * _TOKENS_PER_SECOND)
+            bucket.updated_at = now
+        if bucket.tokens >= 1.0:
+            bucket.tokens -= 1.0
+            return True
+        return False
+
+
+@app.middleware("http")
+async def enforce_request_limits(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+):
+    body_bytes: Optional[bytes] = None
+    if request.method.upper() == "POST":
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                return JSONResponse(status_code=413, content={"error": "payload too large"})
+            if declared_length > MAX_POST_BYTES:
+                return JSONResponse(status_code=413, content={"error": "payload too large"})
+        else:
+            body_bytes = await request.body()
+            if len(body_bytes) > MAX_POST_BYTES:
+                return JSONResponse(status_code=413, content={"error": "payload too large"})
+
+        path = request.url.path
+        if _should_rate_limit(path):
+            if body_bytes is None:
+                body_bytes = await request.body()
+            if len(body_bytes) > MAX_POST_BYTES:
+                return JSONResponse(status_code=413, content={"error": "payload too large"})
+            run_id = _extract_run_id(path, request.scope.get("path_params", {}))
+            agent_id = _extract_agent_id(path, body_bytes)
+            if run_id and agent_id:
+                allowed = await _consume_rate_limit_token(run_id, agent_id)
+                if not allowed:
+                    return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
+
+    return await call_next(request)
 
 
 @app.middleware("http")
