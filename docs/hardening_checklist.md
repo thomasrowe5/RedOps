@@ -1,0 +1,9 @@
+- [ ] JWT required for all mutating endpoints
+- [ ] Rate limit (burst/rate) enforced and tested
+- [ ] Content-Length limits enforced
+- [ ] Non-root containers, seccomp profile applied
+- [ ] Prometheus /metrics exporting, dashboard created
+- [ ] NDJSON batching + atomic rotate verified by tests
+- [ ] Audit hash chain verified by tests
+- [ ] Bandit + Trivy clean (no highs)
+- [ ] CI blocks on lint/type/security/tests
