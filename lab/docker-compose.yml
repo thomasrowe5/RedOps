@@ -5,6 +5,26 @@ networks:
     driver: bridge
 
 services:
+  orchestrator:
+    build:
+      context: ../orchestrator
+    ports:
+      - "8000:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./docker/seccomp-redops.json
+    ulimits:
+      nofile: 65536
+    volumes:
+      - orchestrator-data:/app/data
+    networks:
+      - redops_net
+
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
     environment:
@@ -67,5 +87,6 @@ services:
     # Intentionally vulnerable file upload service for lab testing only.
 
 volumes:
+  orchestrator-data:
   elastic-data:
   neo4j-data:
