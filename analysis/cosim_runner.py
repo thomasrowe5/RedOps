@@ -302,8 +302,7 @@ def determine_containment(responses: List[Dict[str, object]], run_dir: Path) -> 
     return containment_active, containment_time
 
 
-def compute_metrics(run_id: str) -> Dict[str, object]:
-    run_dir = RUN_DATA_DIR / run_id
+def _compute_metrics(run_dir: Path) -> Dict[str, object]:
     events = read_json_lines(run_dir / "events.json")
     detections = read_json_lines(run_dir / "detections.json")
     responses = read_json_lines(run_dir / "responses.jsonl")
@@ -346,6 +345,11 @@ def compute_metrics(run_id: str) -> Dict[str, object]:
         "detections_observed": len(detections),
         "responses_observed": len(responses),
     }
+
+
+def compute_metrics(run_id: str) -> Dict[str, object]:
+    run_dir = RUN_DATA_DIR / run_id
+    return _compute_metrics(run_dir)
 
 
 def run_simulation(args: Arguments) -> Dict[str, object]:
