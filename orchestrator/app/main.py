@@ -18,6 +18,7 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from . import detector
+from .jobs import BatchWriter, JobBus, QueueFullError
 
 try:  # Optional dependency used to parse scenario YAML.
     import yaml  # type: ignore
@@ -45,6 +46,7 @@ RUNS_DIR = DATA_DIR / "runs"
 class RunRecord:
     """In-memory representation of a scheduled run."""
 
+    run_id: str
     scenario_id: str
     status: str
     events_path: Path
@@ -57,6 +59,9 @@ job_queue: asyncio.Queue[str] = asyncio.Queue()
 worker_task: Optional[asyncio.Task[None]] = None
 runs: Dict[str, RunRecord] = {}
 runs_lock = asyncio.Lock()
+
+JOB_BUS = JobBus()
+BATCH_WRITER = BatchWriter(JOB_BUS, RUNS_DIR)
 
 
 def ensure_directories() -> None:
@@ -77,7 +82,7 @@ def run_events_path(run_id: str) -> Path:
 
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir / "events.json"
+    return run_dir / "events.ndjson"
 
 
 def run_responses_path(run_id: str) -> Path:
@@ -96,16 +101,29 @@ def run_policy_path(run_id: str) -> Path:
     return run_dir / "policy.json"
 
 
-def append_event(record: RunRecord, event: Dict[str, Any]) -> None:
-    """Append a JSON event with timestamp metadata to the run's event log."""
+async def enqueue_run_event(
+    run_id: str,
+    event: Dict[str, Any],
+    *,
+    timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Enqueue an enriched event for asynchronous persistence."""
 
     enriched = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         **event,
     }
-    record.events_path.parent.mkdir(parents=True, exist_ok=True)
-    with record.events_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(enriched) + "\n")
+    BATCH_WRITER.ensure_writer(run_id)
+    success = await JOB_BUS.put_event(run_id, enriched, timeout=timeout)
+    if not success:
+        raise QueueFullError(f"queue full for run {run_id}")
+    return enriched
+
+
+async def append_event(record: RunRecord, event: Dict[str, Any]) -> Dict[str, Any]:
+    """Append a JSON event with timestamp metadata to the run's event log."""
+
+    return await enqueue_run_event(record.run_id, event)
 
 
 def parse_actions_from_scenario(body: str) -> List[Dict[str, Any]]:
@@ -152,7 +170,7 @@ async def run_worker() -> None:
                 if record is None:
                     continue
                 record.status = "running"
-            append_event(record, {"type": "run_started", "run_id": run_id})
+            await append_event(record, {"type": "run_started", "run_id": run_id})
 
             scenario_file = scenario_path_from_id(record.scenario_id)
             try:
@@ -161,7 +179,7 @@ async def run_worker() -> None:
                 async with runs_lock:
                     record.status = "error"
                     record.error = "Scenario definition not found"
-                append_event(
+                await append_event(
                     record,
                     {
                         "type": "run_error",
@@ -175,7 +193,7 @@ async def run_worker() -> None:
             async with runs_lock:
                 record.actions = actions
                 record.action_pointer = 0
-            append_event(
+            await append_event(
                 record,
                 {
                     "type": "actions_loaded",
@@ -187,7 +205,7 @@ async def run_worker() -> None:
             if not actions:
                 async with runs_lock:
                     record.status = "completed"
-                append_event(
+                await append_event(
                     record,
                     {"type": "run_completed", "run_id": run_id, "reason": "no_actions"},
                 )
@@ -198,7 +216,7 @@ async def run_worker() -> None:
                     record.status = "error"
                     record.error = str(exc)
             if record is not None:
-                append_event(
+                await append_event(
                     record,
                     {"type": "run_error", "run_id": run_id, "message": record.error},
                 )
@@ -212,6 +230,7 @@ async def startup_event() -> None:
 
     ensure_directories()
     LOGGER.info("RedOps orchestrator running in LAB MODE (local only)")
+    BATCH_WRITER.start()
     global worker_task
     worker_task = asyncio.create_task(run_worker())
 
@@ -224,6 +243,7 @@ async def shutdown_event() -> None:
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+    await BATCH_WRITER.shutdown()
 
 
 @app.post("/scenarios", summary="Create a scenario")
@@ -248,14 +268,17 @@ async def schedule_run(scenario_id: str) -> Dict[str, Any]:
     run_id = uuid.uuid4().hex
     events_path = run_events_path(run_id)
     events_path.write_text("", encoding="utf-8")
+    legacy_events_path = events_path.with_suffix(".json")
+    legacy_events_path.write_text("", encoding="utf-8")
     record = RunRecord(
+        run_id=run_id,
         scenario_id=scenario_id,
         status="queued",
         events_path=events_path,
     )
     async with runs_lock:
         runs[run_id] = record
-    append_event(record, {"type": "run_created", "run_id": run_id, "scenario_id": scenario_id})
+    await append_event(record, {"type": "run_created", "run_id": run_id, "scenario_id": scenario_id})
     await job_queue.put(run_id)
     return {"run_id": run_id, "status": record.status}
 
@@ -302,7 +325,7 @@ async def run_events(run_id: str) -> Dict[str, Any]:
 
 
 @app.post("/runs/{run_id}/events", summary="Ingest run event")
-async def ingest_run_event(run_id: str, event: Dict[str, Any] = Body(...)) -> Dict[str, str]:
+async def ingest_run_event(run_id: str, event: Dict[str, Any] = Body(...)) -> JSONResponse:
     """Record an externally produced event for a run."""
 
     async with runs_lock:
@@ -313,10 +336,26 @@ async def ingest_run_event(run_id: str, event: Dict[str, Any] = Body(...)) -> Di
     if event.get("kind") != "simulated":
         return JSONResponse(status_code=400, content={"error": "non-simulated event rejected"})
 
-    enriched_event = {"type": "agent_event", "run_id": run_id, **event}
-    append_event(record, enriched_event)
+    payload = {"type": "agent_event", "run_id": run_id, **event}
+    try:
+        enriched_event = await enqueue_run_event(run_id, payload, timeout=0)
+    except QueueFullError as exc:
+        raise HTTPException(status_code=429, detail="queue full") from exc
     detector.process_event_for_detections(enriched_event)
-    return {"status": "accepted"}
+    return JSONResponse(status_code=202, content={"status": "enqueued"})
+
+
+@app.get("/runs/{run_id}/queue_stats", summary="Run queue stats")
+async def run_queue_stats(run_id: str) -> Dict[str, int]:
+    """Expose the current depth of the run's event queue."""
+
+    async with runs_lock:
+        record_exists = run_id in runs
+    if not record_exists and not (RUNS_DIR / run_id).exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    depth = JOB_BUS.stats().get(run_id, 0)
+    return {"depth": depth}
 
 
 @app.get("/runs/{run_id}/detections", summary="Run detections")
@@ -405,9 +444,9 @@ async def run_next_action(run_id: str) -> Dict[str, Any]:
             return_value = {"status": "completed"}
 
     if event_to_record is not None:
-        append_event(record, event_to_record)
+        await append_event(record, event_to_record)
     if completion_event is not None:
-        append_event(record, completion_event)
+        await append_event(record, completion_event)
     return return_value
 
 
