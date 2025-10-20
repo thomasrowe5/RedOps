@@ -20,6 +20,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import detector
 from .jobs import BatchWriter, JobBus, QueueFullError
+from .schemas import (
+    Detection,
+    SchemaVersion,
+    VersionedEventIn,
+    VersionedResponseIn,
+)
 
 try:  # Optional dependency used to parse scenario YAML.
     import yaml  # type: ignore
@@ -68,6 +74,16 @@ runs_lock = asyncio.Lock()
 JOB_BUS = JobBus()
 BATCH_WRITER = BatchWriter(JOB_BUS, RUNS_DIR)
 SHUTDOWN_TRIGGERED = asyncio.Event()
+
+def _require_schema_v1(schema_value: str) -> None:
+    if schema_value != SCHEMA_V1:
+        raise HTTPException(status_code=400, detail="unsupported schema version")
+
+
+def _wrap_payload(payload: Any) -> Dict[str, Any]:
+    return {"schema": SCHEMA_V1, "payload": payload}
+
+SCHEMA_V1 = SchemaVersion.REDOPS_V1.value
 
 
 async def ensure_directories() -> None:
@@ -468,7 +484,7 @@ async def run_events(
 
 
 @app.post("/runs/{run_id}/events", summary="Ingest run event")
-async def ingest_run_event(run_id: str, event: Dict[str, Any] = Body(...)) -> JSONResponse:
+async def ingest_run_event(run_id: str, event: VersionedEventIn) -> JSONResponse:
     """Record an externally produced event for a run."""
 
     async with runs_lock:
@@ -476,16 +492,19 @@ async def ingest_run_event(run_id: str, event: Dict[str, Any] = Body(...)) -> JS
     if record is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    if event.get("kind") != "simulated":
+    _require_schema_v1(event.schema)
+    event_payload_model = event.payload
+    if event_payload_model.kind != "simulated":
         return JSONResponse(status_code=400, content={"error": "non-simulated event rejected"})
 
-    payload = {"type": "agent_event", "run_id": run_id, **event}
+    event_payload = json.loads(event_payload_model.json(exclude_none=True))
+    payload = {"type": "agent_event", "run_id": run_id, **event_payload}
     try:
         enriched_event = await enqueue_run_event(run_id, payload, timeout=0)
     except QueueFullError as exc:
         raise HTTPException(status_code=429, detail="queue full") from exc
     detector.process_event_for_detections(enriched_event)
-    return JSONResponse(status_code=202, content={"status": "enqueued"})
+    return JSONResponse(status_code=202, content=_wrap_payload({"status": "enqueued"}))
 
 
 @app.get("/runs/{run_id}/queue_stats", summary="Run queue stats")
@@ -502,7 +521,7 @@ async def run_queue_stats(run_id: str) -> Dict[str, int]:
 
 
 @app.get("/runs/{run_id}/detections", summary="Run detections")
-async def run_detections(run_id: str, since_ts: Optional[str] = None) -> List[Dict[str, Any]]:
+async def run_detections(run_id: str, since_ts: Optional[str] = None) -> Dict[str, Any]:
     """Return detections generated for a run."""
 
     async with runs_lock:
@@ -511,11 +530,16 @@ async def run_detections(run_id: str, since_ts: Optional[str] = None) -> List[Di
     if not record_exists and not await _path_exists(run_dir):
         raise HTTPException(status_code=404, detail="Run not found")
 
-    return detector.get_detections_since(run_id, since_ts)
+    raw_detections = detector.get_detections_since(run_id, since_ts)
+    validated = [
+        json.loads(Detection.parse_obj(detection).json(exclude_none=True))
+        for detection in raw_detections
+    ]
+    return _wrap_payload(validated)
 
 
 @app.post("/runs/{run_id}/responses", summary="Record response action")
-async def record_run_response(run_id: str, response: Dict[str, Any] = Body(...)) -> Dict[str, str]:
+async def record_run_response(run_id: str, response: VersionedResponseIn) -> Dict[str, Any]:
     """Persist a blue-team style response associated with a run."""
 
     async with runs_lock:
@@ -524,10 +548,14 @@ async def record_run_response(run_id: str, response: Dict[str, Any] = Body(...))
     if not record_exists and not await _path_exists(run_dir):
         raise HTTPException(status_code=404, detail="Run not found")
 
-    responses_path = await run_responses_path(run_id)
-    await _append_text(responses_path, json.dumps(response) + "\n")
+    _require_schema_v1(response.schema)
+    response_payload_model = response.payload
+    response_payload = json.loads(response_payload_model.json(exclude_none=True))
 
-    policy_changes = response.get("apply_policy_changes")
+    responses_path = await run_responses_path(run_id)
+    await _append_text(responses_path, json.dumps(response_payload) + "\n")
+
+    policy_changes = response_payload_model.apply_policy_changes
     if isinstance(policy_changes, dict):
         policy_path = await run_policy_path(run_id)
         if await _path_exists(policy_path):
@@ -543,7 +571,7 @@ async def record_run_response(run_id: str, response: Dict[str, Any] = Body(...))
             json.dumps(existing_policy, indent=2, sort_keys=True),
         )
 
-    return {"status": "recorded"}
+    return _wrap_payload({"status": "recorded"})
 
 
 @app.get("/runs/{run_id}/next", summary="Next action")
