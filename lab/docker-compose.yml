@@ -87,6 +87,20 @@ services:
       - redops_net
     # Intentionally vulnerable file upload service for lab testing only.
 
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    networks: [redops_net]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports: ["3001:3000"]
+    networks: [redops_net]
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+
 volumes:
   orchestrator-data:
   elastic-data:
