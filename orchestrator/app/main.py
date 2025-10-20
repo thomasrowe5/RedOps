@@ -6,6 +6,7 @@ LAB_MODE = True
 
 import asyncio
 import contextlib
+import html
 import ipaddress
 import json
 import logging
@@ -18,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Optional, Protocol
 from typing import Tuple
+import re
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -94,6 +96,7 @@ job_queue: asyncio.Queue[str] = asyncio.Queue()
 worker_task: Optional[asyncio.Task[None]] = None
 runs: Dict[str, RunRecord] = {}
 runs_lock = asyncio.Lock()
+_AGENT_LAST_TIMESTAMPS: Dict[Tuple[str, str], datetime] = {}
 
 class JobBusProtocol(Protocol):
     async def put_event(
@@ -244,6 +247,57 @@ def _extract_agent_id(path: str, body: bytes) -> Optional[str]:
         if isinstance(agent_id, str) and agent_id.strip():
             return agent_id.strip()
     return None
+
+
+_CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x1F\x7F]")
+_SAFE_NOTE_PATTERN = re.compile(r"^[A-Za-z0-9 .,;:!?()\-_'\"/@#&]+$")
+_HTML_TAG_PATTERN = re.compile(r"<[^>]*>")
+_FREE_TEXT_FIELDS = {"note", "reason", "response"}
+
+
+def _sanitize_free_text(value: str, field_name: str) -> str:
+    stripped = _HTML_TAG_PATTERN.sub("", value)
+    if field_name == "note" and stripped and not _SAFE_NOTE_PATTERN.fullmatch(stripped):
+        raise HTTPException(status_code=400, detail="note contains unsupported characters")
+    return html.escape(stripped, quote=False)
+
+
+def _sanitize_value(field_name: str, value: Any) -> Any:
+    if isinstance(value, str):
+        if _CONTROL_CHAR_PATTERN.search(value):
+            raise HTTPException(status_code=400, detail=f"{field_name} contains control characters")
+        if field_name in _FREE_TEXT_FIELDS:
+            return _sanitize_free_text(value, field_name)
+        return value
+    if isinstance(value, dict):
+        return {key: _sanitize_value(key, item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_value(field_name, item) for item in value]
+    return value
+
+
+def _sanitize_payload_strings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: _sanitize_value(key, value) for key, value in payload.items()}
+
+
+async def _enforce_monotonic_timestamp(
+    run_id: str, agent_id: str, timestamp: datetime, actor_name: str
+) -> None:
+    key = (run_id, agent_id)
+    last_seen = _AGENT_LAST_TIMESTAMPS.get(key)
+    if last_seen is not None and timestamp < last_seen:
+        await write_audit(
+            run_id,
+            actor_name,
+            "timestamp_regression",
+            {
+                "agent_id": agent_id,
+                "observed_timestamp": timestamp.isoformat(),
+                "last_timestamp": last_seen.isoformat(),
+            },
+        )
+        return
+    _AGENT_LAST_TIMESTAMPS[key] = timestamp
 
 
 async def _consume_rate_limit_token(run_id: str, agent_id: str) -> bool:
@@ -796,7 +850,12 @@ async def ingest_run_event(
     if event_payload_model.kind != "simulated":
         return JSONResponse(status_code=400, content={"error": "non-simulated event rejected"})
 
-    event_payload = json.loads(event_payload_model.json(exclude_none=True))
+    event_payload = _sanitize_payload_strings(
+        json.loads(event_payload_model.json(exclude_none=True))
+    )
+    await _enforce_monotonic_timestamp(
+        run_id, event_payload_model.agent_id, event_payload_model.timestamp, actor.name
+    )
     payload = {"type": "agent_event", "run_id": run_id, **event_payload}
     try:
         enriched_event = await enqueue_run_event(run_id, payload, timeout=0)
@@ -864,12 +923,20 @@ async def record_run_response(
 
     _require_schema_v1(response.schema)
     response_payload_model = response.payload
-    response_payload = json.loads(response_payload_model.json(exclude_none=True))
+    response_payload = _sanitize_payload_strings(
+        json.loads(response_payload_model.json(exclude_none=True))
+    )
+    await _enforce_monotonic_timestamp(
+        run_id,
+        response_payload_model.agent_id,
+        response_payload_model.timestamp,
+        actor.name,
+    )
 
     responses_path = await run_responses_path(run_id)
     await _append_text(responses_path, json.dumps(response_payload) + "\n")
 
-    policy_changes = response_payload_model.apply_policy_changes
+    policy_changes = response_payload.get("apply_policy_changes")
     if isinstance(policy_changes, dict):
         policy_path = await run_policy_path(run_id)
         if await _path_exists(policy_path):
