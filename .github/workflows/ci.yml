@@ -52,3 +52,13 @@ jobs:
 
       - name: Run RL smoke tests
         run: pytest -k "rl"
+
+  blueops-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pyyaml
+      - run: pytest -k "blue" -q
