@@ -1,0 +1,11 @@
+# Default response policy for blue team automation in lab simulations.
+# Adjust thresholds and actions to tune detection and response behavior.
+thresholds:
+  burst_uploads: 3           # number of exfil-like events within 10s to trigger response
+  lateral_moves: 2           # number of lateral-movement events to trigger
+actions:
+  on_exfil_detected: ["block_egress", "rotate_creds"]
+  on_lateral_detected: ["isolate_service"]
+  on_priv_esc_detected: ["reissue_tokens", "increase_logging"]
+cooldown_seconds: 8          # minimum seconds between repeated identical actions
+notes: "All actions are simulated and only affect in-lab policy.json state."
